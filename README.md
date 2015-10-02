@@ -1,4 +1,4 @@
-# Rollbar notifier for Python [![Build Status](https://travis-ci.org/rollbar/pyrollbar.png?branch=v0.9.11)](https://travis-ci.org/rollbar/pyrollbar)
+# Rollbar notifier for Python [![Build Status](https://travis-ci.org/rollbar/pyrollbar.png?branch=v0.10.0)](https://travis-ci.org/rollbar/pyrollbar)
 
 <!-- RemoveNext -->
 Python notifier for reporting exceptions, errors, and log messages to [Rollbar](https://rollbar.com).
@@ -28,7 +28,7 @@ except:
 
 ## Requirements
 
-- Python 2.6, 2.7, 3.2 or 3.3
+- Python 2.6, 2.7, 3.2, 3.3 or 3.4
 - requests 0.12+
 - A Rollbar account
 
@@ -152,6 +152,11 @@ if __name__ == '__main__':
 
 <!-- RemoveNextIfProject -->
 Be sure to replace ```POST_SERVER_ITEM_ACCESS_TOKEN``` with your project's ```post_server_item``` access token, which you can find in the Rollbar.com interface.
+
+
+### Twisted
+
+Check out the [Twisted example](https://github.com/rollbar/pyrollbar/tree/master/rollbar/examples/twisted).
 
 
 ### Other
@@ -351,6 +356,7 @@ One of:
 - agent -- writes messages to a log file for consumption by rollbar-agent
 - tornado -- uses the Tornado async library to send the payload
 - gae -- uses the Google AppEngineFetch library to send the payload
+- twisted -- uses the Twisted event-driven networking library to send the payload
 
 Default: ```thread```
 
@@ -360,6 +366,9 @@ Default: ```thread```
     <dl>
       <dt>enabled</dt>
       <dd>If `True`, variable values will be collected for stack traces. Default `True`.</dd>
+      <dt>safe_repr</dt>
+      <dd>If `True`, non-built-in objects will be serialized into just their class name. If `False` `repr(obj)`
+      will be used for serialization. Default `True`.</dd>
       <dt>sizes</dt>
       <dd>Dictionary of configuration describing the max size to repr() for each type.
         <dl>

@@ -1,7 +1,7 @@
 """
 Plugin for Pyramid apps to submit errors to Rollbar
 """
-__version__ = '0.9.11'
+__version__ = '0.10.0'
 
 import copy
 import inspect
@@ -16,11 +16,12 @@ import threading
 import time
 import traceback
 import types
-import urllib
 import uuid
 import wsgiref.util
 
 import requests
+
+log = logging.getLogger(__name__)
 
 try:
     # Python 3
@@ -28,6 +29,7 @@ try:
     from urllib.parse import urlencode
     import reprlib
     string_types = (str, bytes)
+    unicode = str
 except ImportError:
     # Python 2
     import urlparse
@@ -86,16 +88,101 @@ try:
 except ImportError:
     AppEngineFetch = None
 
+def passthrough_decorator(func):
+    def wrap(*args, **kwargs):
+        return func(*args, **kwargs)
+    return wrap
+
 try:
     from tornado.gen import coroutine as tornado_coroutine
     from tornado.httpclient import AsyncHTTPClient as TornadoAsyncHTTPClient
 except ImportError:
-    def tornado_coroutine(func):
-        def wrap(*args, **kwargs):
-            return func(*args, **kwargs)
-        return wrap
-
+    tornado_coroutine = passthrough_decorator
     TornadoAsyncHTTPClient = None
+
+try:
+    from twisted.internet import reactor
+    from twisted.internet.defer import inlineCallbacks, Deferred, returnValue, succeed
+    from twisted.internet.protocol import Protocol
+    from twisted.python import log as twisted_log
+    from twisted.web.client import Agent as TwistedHTTPClient
+    from twisted.web.http_headers import Headers as TwistedHeaders
+    from twisted.web.iweb import IBodyProducer
+
+    from zope.interface import implementer
+
+
+    try:
+        # Verify we can make HTTPS requests with Twisted.
+        # From http://twistedmatrix.com/documents/12.0.0/core/howto/ssl.html
+        from OpenSSL import SSL
+    except ImportError:
+        log.exception('Rollbar requires SSL to work with Twisted')
+        raise
+
+
+    @implementer(IBodyProducer)
+    class StringProducer(object):
+
+        def __init__(self, body):
+            self.body = body
+            self.length = len(body)
+
+        def startProducing(self, consumer):
+            consumer.write(self.body)
+            return succeed(None)
+
+        def pauseProducing(self):
+            pass
+
+        def stopProducing(self):
+            pass
+
+
+    class ResponseAccumulator(Protocol):
+        def __init__(self, length, finished):
+            self.remaining = length
+            self.finished = finished
+            self.response = ''
+
+        def dataReceived(self, bytes):
+            if self.remaining:
+                chunk = bytes[:self.remaining]
+                self.response += chunk
+                self.remaining -= len(chunk)
+
+        def connectionLost(self, reason):
+            self.finished.callback(self.response)
+
+
+    def log_handler(event):
+        """
+        Default uncaught error handler
+        """
+        try:
+            if not event.get('isError') or 'failure' not in event:
+                return
+
+            err = event['failure']
+
+            # Don't report Rollbar internal errors to ourselves
+            if issubclass(err.type, ApiException):
+                log.error('Rollbar internal error: %s', err.value)
+            else:
+                report_exc_info((err.type, err.value, err.getTracebackObject()))
+        except:
+            log.exception('Error while reporting to Rollbar')
+
+
+    # Add Rollbar as a log handler which will report uncaught errors
+    twisted_log.addObserver(log_handler)
+
+
+except ImportError:
+    TwistedHTTPClient = None
+    inlineCallbacks = passthrough_decorator
+    StringProducer = None
+    
 
 def get_request():
     """
@@ -151,8 +238,6 @@ def _get_pylons_request():
 
 BASE_DATA_HOOK = None
 
-log = logging.getLogger(__name__)
-
 agent_log = None
 
 VERSION = __version__
@@ -182,7 +267,7 @@ SETTINGS = {
     'root': None,  # root path to your code
     'branch': None,  # git branch name
     'code_version': None,
-    'handler': 'thread',  # 'blocking', 'thread', 'agent', 'tornado' or 'gae'
+    'handler': 'thread',  # 'blocking', 'thread', 'agent', 'tornado', 'gae' or 'twisted'
     'endpoint': DEFAULT_ENDPOINT,
     'timeout': DEFAULT_TIMEOUT,
     'agent.log_file': 'log.rollbar',
@@ -194,6 +279,7 @@ SETTINGS = {
     'allow_logging_basic_config': True,  # set to False to avoid a call to logging.basicConfig()
     'locals': {
         'enabled': True,
+        'safe_repr': True,
         'sizes': DEFAULT_LOCALS_SIZES
     },
     'verify_https': True
@@ -315,6 +401,11 @@ def send_payload(payload):
             log.error('Unable to find AppEngine URLFetch module')
             return
         _send_payload_appengine(payload)
+    elif handler == 'twisted':
+        if TwistedHTTPClient is None:
+            log.error('Unable to find twisted')
+            return
+        _send_payload_twisted(payload)
     else:
         # default to 'thread'
         thread = threading.Thread(target=_send_payload, args=(payload,))
@@ -670,6 +761,16 @@ def _get_func_from_frame(frame):
     return func
 
 
+def _flatten_nested_lists(l):
+    ret = []
+    for x in l:
+        if isinstance(x, list):
+            ret.extend(_flatten_nested_lists(x))
+        else:
+            ret.append(x)
+    return ret
+
+
 def _add_locals_data(data, exc_info):
     if not SETTINGS['locals']['enabled']:
         return
@@ -711,17 +812,29 @@ def _add_locals_data(data, exc_info):
                     if init_func:
                         argspec = inspect.getargspec(init_func)
 
+            # Get all of the named args
+            #
+            # args can be a nested list of args in the case where there
+            # are anonymous tuple args provided.
+            # e.g. in Python 2 you can:
+            #   def func((x, (a, b), z)):
+            #       return x + a + b + z
+            #
+            #   func((1, (1, 2), 3))
+            named_args = _flatten_nested_lists(arginfo.args)
+
             # Fill in all of the named args
-            for named_arg in arginfo.args:
-                args.append(_local_repr(local_vars[named_arg]))
+            for named_arg in named_args:
+                if named_arg in local_vars:
+                    args.append(_local_repr(_scrub_obj(local_vars[named_arg], key=named_arg)))
 
             # Add any varargs
             if arginfo.varargs is not None:
-                args.extend(map(_local_repr, local_vars[arginfo.varargs]))
+                args.extend(map(lambda x: _local_repr(_scrub_obj(x)), local_vars[arginfo.varargs]))
 
             # Fill in all of the kwargs
             if arginfo.keywords is not None:
-                kw.update(dict((k, _local_repr(v)) for k, v in local_vars[arginfo.keywords].items()))
+                kw.update(dict((k, _local_repr(_scrub_obj(v, key=k))) for k, v in local_vars[arginfo.keywords].items()))
 
             if argspec and argspec.defaults:
                 # Put any of the args that have defaults into kwargs
@@ -734,11 +847,11 @@ def _add_locals_data(data, exc_info):
 
             # Optionally fill in locals for this frame
             if local_vars and _check_add_locals(cur_frame, frame_num, num_frames):
-                _locals.update(dict((k, _local_repr(v)) for k, v in local_vars.items()))
+                _locals.update(dict((k, _local_repr(_scrub_obj(v, key=k))) for k, v in local_vars.items()))
 
-            args = _scrub_obj(args)
-            kw = _scrub_obj(kw)
-            _locals = _scrub_obj(_locals)
+            args = args
+            kw = kw
+            _locals = _locals
 
         except Exception as e:
             log.exception('Error while extracting arguments from frame. Ignoring.')
@@ -800,7 +913,10 @@ def _build_request_data(request):
         return _build_werkzeug_request_data(request)
 
     if WerkzeugLocalProxy and isinstance(request, WerkzeugLocalProxy):
-        actual_request = request._get_current_object()
+        try:
+            actual_request = request._get_current_object()
+        except RuntimeError:
+            return None
         return _build_werkzeug_request_data(actual_request)
 
     # tornado
@@ -823,7 +939,7 @@ def _scrub_request_data(request_data):
     Scrubs out sensitive information out of request data
     """
     if request_data:
-        for field in ['POST', 'GET', 'headers']:
+        for field in ['POST', 'GET', 'headers', 'json']:
             if request_data.get(field):
                 request_data[field] = _scrub_obj(request_data[field])
 
@@ -850,7 +966,7 @@ def _scrub_request_url(url_string):
     return scrubbed_url_string
 
 
-def _scrub_obj(obj, replacement_character='*'):
+def _scrub_obj(obj, replacement_character='*', key=None):
     """
     Given an object, (e.g. dict/list/string) return the same object with sensitive
     data scrubbed out, (replaced with asterisks.)
@@ -858,31 +974,41 @@ def _scrub_obj(obj, replacement_character='*'):
     Fields to scrub out are defined in SETTINGS['scrub_fields'].
     """
     scrub_fields = set(SETTINGS['scrub_fields'])
+    memo = set()
 
     def _scrub(obj, k=None):
+        # Do circular reference checks only for containers
+        obj_id = id(obj)
+        if obj_id in memo:
+            return '<Circular Reference>'
+
         if k is not None and _in_scrub_fields(k, scrub_fields):
             if isinstance(obj, string_types):
                 return replacement_character * min(50, len(obj))
             elif isinstance(obj, list):
+                memo.add(obj_id)
                 return [_scrub(v, k) for v in obj]
             elif isinstance(obj, dict):
+                memo.add(obj_id)
                 return {replacement_character: replacement_character}
             else:
                 return replacement_character
         elif isinstance(obj, dict):
+            memo.add(obj_id)
             return dict((_k,  _scrub(v, _k)) for _k, v in obj.items())
         elif isinstance(obj, list):
+            memo.add(obj_id)
             return [_scrub(x, k) for x in obj]
         elif isinstance(obj, float) and math.isnan(obj):
             return 'NaN'
         elif isinstance(obj, float) and math.isinf(obj):
-            return 'Inf'
+            return 'Infinity'
         elif isinstance(obj, (numbers.Integral, float)) and str(obj + 0) != str(obj):
             return str(obj)
         else:
             return obj
 
-    return _scrub(obj)
+    return _scrub(obj, k=key)
 
 
 if sys.version_info[0] > 2:
@@ -898,6 +1024,7 @@ else:
             except UnicodeEncodeError:
                 return x.encode('utf-8')
 
+
 def _in_scrub_fields(val, scrub_fields):
     val = _to_str(val).lower()
     for field in set(scrub_fields):
@@ -910,14 +1037,26 @@ def _in_scrub_fields(val, scrub_fields):
 
 def _local_repr(obj):
     if isinstance(obj, tuple(blacklisted_local_types)):
-        return type(obj)
+        return unicode(type(obj))
 
-    orig = repr(obj)
-    reprd = _repr.repr(obj)
-    if reprd == orig:
-        return obj
-    else:
-        return reprd
+    is_builtin = _is_builtin_type(obj)
+
+    if is_builtin:
+        orig_reprd = repr(obj)
+        _reprd = _repr.repr(obj)
+        if orig_reprd == _reprd:
+            return obj
+
+        return _reprd
+
+    if SETTINGS.get('locals', {}).get('safe_repr'):
+        return unicode(type(obj))
+
+    return _repr.repr(obj)
+
+
+def _is_builtin_type(obj):
+    return obj.__class__.__module__ in ('__builtin__', 'builtins')
 
 
 def _build_webob_request_data(request):
@@ -930,7 +1069,7 @@ def _build_webob_request_data(request):
 
     try:
         if request.json:
-            request_data['body'] = request.body
+            request_data['json'] = request.json
     except:
         pass
 
@@ -986,8 +1125,11 @@ def _build_werkzeug_request_data(request):
         'files_keys': request.files.keys(),
     }
 
-    if request.json:
-        request_data['body'] = json.dumps(_scrub_obj(request.json))
+    try:
+        if request.json:
+            request_data['body'] = json.dumps(_scrub_obj(request.json))
+    except Exception:
+        pass
 
     return request_data
 
@@ -1171,6 +1313,43 @@ def _post_api_tornado(path, payload, access_token=None):
     r.headers.update(resp.headers)
 
     _parse_response(path, SETTINGS['access_token'], payload, r)
+
+
+def _send_payload_twisted(payload):
+    try:
+        _post_api_twisted('item/', payload, access_token=payload.get('access_token'))
+    except Exception as e:
+        log.exception('Exception while posting item %r', e)
+
+
+@inlineCallbacks
+def _post_api_twisted(path, payload, access_token=None):
+    headers = {'Content-Type': ['application/json']}
+
+    if access_token is not None:
+        headers['X-Rollbar-Access-Token'] = [access_token]
+
+    # Serialize this ourselves so we can handle error cases more gracefully
+    payload = ErrorIgnoringJSONEncoder().encode(payload)
+
+    url = urlparse.urljoin(SETTINGS['endpoint'], path)
+
+    agent = TwistedHTTPClient(reactor, connectTimeout=SETTINGS.get('timeout', DEFAULT_TIMEOUT))
+    resp = yield agent.request(
+           'POST',
+           url,
+           TwistedHeaders(headers),
+           StringProducer(payload))
+
+    r = requests.Response()
+    r.status_code = resp.code
+    r.headers.update(resp.headers.getAllRawHeaders())
+    bodyDeferred = Deferred()
+    resp.deliverBody(ResponseAccumulator(resp.length, bodyDeferred))
+    body = yield bodyDeferred
+    r._content = body
+    _parse_response(path, SETTINGS['access_token'], payload, r)
+    yield returnValue(None)
 
 
 def _parse_response(path, access_token, params, resp, endpoint=None):
